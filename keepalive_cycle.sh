@@ -1,128 +1,75 @@
-#!/usr/bin/env bash
-# keepalive_cycle_io.sh
-# Mantiene la máquina activa (CPU + red + disco) 2 min cada 5 h sin root.
-# Limpia archivos temporales y borra logs de terminal tras cada ciclo.
+# === PEGA TODO ESTO EN TU TERMINAL ===
+mkdir -p ~/.local/bin
 
-set -euo pipefail
+# --- SCRIPT: TODO EN RAM, SE BORRA AUTOMÁTICO ---
+cat > ~/.local/bin/keepalive.sh << 'EOF'
+#!/bin/bash
 
-# ⚙️ Parámetros configurables
-CPU_WORKERS=${CPU_WORKERS:-2}
-CPU_INTENSITY=${CPU_INTENSITY:-0.9}
-NET_WORKERS=${NET_WORKERS:-2}
-NET_RATE=${NET_RATE:-10}
-IO_WORKERS=${IO_WORKERS:-2}
-IO_FILE_SIZE_MB=${IO_FILE_SIZE_MB:-10}
-DURATION=${DURATION:-120}        # 2 minutos
-INTERVAL=${INTERVAL:-18000}      # 5 horas
-HTTP_PORT=${HTTP_PORT:-8082}
-WORKDIR="/tmp/keepalive_cycle_io"
+# ========================================
+# KeepAlive CentOS 8 - SIN ROOT - SIN SYSTEMD
+# Todo en RAM → se borra al apagar
+# Usa crontab @reboot
+# ========================================
 
-mkdir -p "$WORKDIR"
+# Directorio único en RAM (se autodestruye al apagar)
+RAM_DIR="/dev/shm/keepalive_$(whoami)_$$"
+HEARTBEAT="$RAM_DIR/heartbeat.tmp"
+INTERVAL=3600  # 1 hora
 
-# --- Generar scripts auxiliares ---
-CPU_SCRIPT="$WORKDIR/cpu_worker.py"
-NET_SCRIPT="$WORKDIR/net_worker.sh"
-SERVER_SCRIPT="$WORKDIR/server.py"
-IO_SCRIPT="$WORKDIR/io_worker.sh"
+# Crear directorio en RAM
+mkdir -p "$RAM_DIR"
 
-cat > "$SERVER_SCRIPT" <<'PY'
-#!/usr/bin/env python3
-from http.server import HTTPServer, BaseHTTPRequestHandler
-class H(BaseHTTPRequestHandler):
-    def do_GET(self):
-        msg = b"ok"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(msg)))
-        self.end_headers()
-        self.wfile.write(msg)
-    def log_message(self, *args): pass
-if __name__ == "__main__":
-    import sys
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8082
-    HTTPServer(("127.0.0.1", port), H).serve_forever()
-PY
-
-cat > "$CPU_SCRIPT" <<'PY'
-#!/usr/bin/env python3
-import hashlib, os, time, sys
-intensity = float(sys.argv[1]) if len(sys.argv) > 1 else 0.9
-busy, idle = intensity * 0.1, max(0.0001, (1 - intensity) * 0.1)
-data = os.urandom(4096)
-while True:
-    t0 = time.time()
-    while time.time() - t0 < busy:
-        hashlib.sha256(data).digest()
-    time.sleep(idle)
-PY
-
-cat > "$NET_SCRIPT" <<'SH'
-#!/usr/bin/env bash
-port=$1; rate=$2
-interval=$(awk "BEGIN {print 1.0 / ($rate)}")
-url="http://127.0.0.1:${port}/"
+# Bucle infinito
 while true; do
-  curl --silent --max-time 3 --output /dev/null "$url" || true
-  sleep "$interval"
+    START=$(date +%s)
+
+    # 1. CPU ligera
+    for i in {1..50000}; do
+        : $((i * i))
+    done
+
+    # 2. Escribir en RAM y BORRAR INMEDIATAMENTE
+    echo "ACTIVO: $(date '+%Y-%m-%d %H:%M:%S')" > "$HEARTBEAT"
+    sleep 1
+    rm -f "$HEARTBEAT"  # ← BORRADO AUTOMÁTICO
+
+    # 3. Tráfico de red (3 DNS de respaldo)
+    ping -c 1 -W 2 8.8.8.8 > /dev/null 2>&1 || \
+    ping -c 1 -W 2 1.1.1.1 > /dev/null 2>&1 || \
+    ping -c 1 -W 2 208.67.222.222 > /dev/null 2>&1
+
+    # 4. Ratón (solo si hay GUI y xdotool)
+    if [ -n "$DISPLAY" ] && command -v xdotool &> /dev/null; then
+        xdotool mousemove_relative 1 0 2>/dev/null
+        sleep 0.1
+        xdotool mousemove_relative -- -1 0 2>/dev/null
+    fi
+
+    # 5. Dormir hasta completar intervalo
+    END=$(date +%s)
+    SLEEP_TIME=$((INTERVAL - (END - START)))
+    [ $SLEEP_TIME -gt 0 ] && sleep $SLEEP_TIME
 done
-SH
 
-cat > "$IO_SCRIPT" <<'SH'
-#!/usr/bin/env bash
-# io_worker.sh <file> <size_MB>
-FILE=$1
-SIZE_MB=${2:-10}
-BLOCKS=$((SIZE_MB * 256)) # 256 * 4KB = 1MB aprox
-while true; do
-  dd if=/dev/urandom of="$FILE" bs=4K count=$BLOCKS conv=fsync >/dev/null 2>&1
-  dd if="$FILE" of=/dev/null bs=4K >/dev/null 2>&1
-  sleep 1
-done
-SH
+# Al salir (nunca llega), borrar todo
+rm -rf "$RAM_DIR"
+EOF
 
-chmod +x "$SERVER_SCRIPT" "$CPU_SCRIPT" "$NET_SCRIPT" "$IO_SCRIPT"
+# Hacer ejecutable
+chmod +x ~/.local/bin/keepalive.sh
 
-# --- Bucle principal ---
-echo "[*] KeepAlive+IO iniciado (cada 5h por 2min)..."
+# --- AÑADIR A CRONTAB (SIN ROOT) ---
+(crontab -l 2>/dev/null | grep -v "keepalive.sh"; echo "@reboot $HOME/.local/bin/keepalive.sh > /dev/null 2>&1 &") | crontab -
 
-while true; do
-  echo "[$(date '+%F %T')] 🔄 Iniciando carga..."
-
-  # Servidor local
-  python3 "$SERVER_SCRIPT" "$HTTP_PORT" >/dev/null 2>&1 &
-  SERVER_PID=$!
-
-  # Procesos CPU
-  PIDS=()
-  for i in $(seq 1 $CPU_WORKERS); do
-    python3 "$CPU_SCRIPT" "$CPU_INTENSITY" >/dev/null 2>&1 &
-    PIDS+=($!)
-  done
-
-  # Procesos red
-  for i in $(seq 1 $NET_WORKERS); do
-    bash "$NET_SCRIPT" "$HTTP_PORT" "$NET_RATE" >/dev/null 2>&1 &
-    PIDS+=($!)
-  done
-
-  # Procesos I/O (disco)
-  for i in $(seq 1 $IO_WORKERS); do
-    bash "$IO_SCRIPT" "$WORKDIR/io_tmp_$i.bin" "$IO_FILE_SIZE_MB" >/dev/null 2>&1 &
-    PIDS+=($!)
-  done
-
-  # Esperar 2 minutos
-  sleep "$DURATION"
-
-  # Finalizar todo
-  kill "$SERVER_PID" >/dev/null 2>&1 || true
-  for pid in "${PIDS[@]}"; do kill "$pid" >/dev/null 2>&1 || true; done
-  rm -f "$WORKDIR"/io_tmp_*.bin 2>/dev/null || true
-
-  echo "[$(date '+%F %T')] ✅ Carga detenida. Próxima en 5h."
-  
-  # 🧹 Limpiar terminal para evitar acumulación de logs
-  clear
-
-  sleep "$INTERVAL"
-done
+echo "¡KeepAlive instalado SIN ROOT NI SYSTEMD!"
+echo "→ Se ejecuta al reiniciar con crontab @reboot"
+echo "→ Todo en RAM → se borra al apagar"
+echo "→ NO deja archivos permanentes"
+echo ""
+echo "Verifica que crontab se guardó:"
+crontab -l | grep keepalive
+echo ""
+echo "Prueba manual:"
+~/.local/bin/keepalive.sh &
+echo "PID: $!"
+echo "Mata con: kill $!"
